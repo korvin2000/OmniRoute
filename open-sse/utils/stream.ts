@@ -2487,6 +2487,8 @@ export function createSSEStream(options: StreamOptions = {}) {
                   console.warn(
                     `[STREAM] Empty assistant response after tool_calls completion (${provider || "provider"}:${model || "unknown"}) — sessionId=${sessionId}`
                   );
+                } else if (passthroughHasToolCalls && !content.trim() && reasoning.trim()) {
+                  message.content = "";
                 }
 
                 const responseBody = {
