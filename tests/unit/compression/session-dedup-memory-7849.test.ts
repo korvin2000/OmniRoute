@@ -9,7 +9,14 @@ import { sessionDedupEngine } from "../../../open-sse/services/compression/engin
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../../..");
 const FIXTURE = join(REPO_ROOT, "tests/fixtures/compression/session-dedup-memory-7849.ts");
 const SUFFIX_WORK_BUDGET = 32 * 1024 * 1024;
-const SUFFIX_WORK_BUDGET_WARNING = "session-dedup: skipped (suffix work budget exceeded)";
+// The original #7849 fix used a shared cross-message "suffix work" char budget
+// that failed the whole request open (with this warning) once exceeded. PR
+// #8438 replaced that mechanism with a simpler, per-message bound
+// (MAX_SUFFIX_STARTS / MAX_TOTAL_BLOCK_BYTES in session-dedup/index.ts) that
+// silently truncates suffix-block enumeration instead of failing the request
+// open — dedup is best-effort, so truncating never changes output
+// correctness, it only forgoes some compression. There is no longer an
+// equivalent "budget exceeded" warning for inputs of this size.
 
 function makeFixedWidthText(lineCount: number, lineChars: number, tag: string): string {
   return Array.from({ length: lineCount }, (_, index) => {
@@ -38,7 +45,7 @@ function makeSharedBudgetBody(): Record<string, unknown> {
   };
 }
 
-test("#7849: shares the two-pass suffix-work budget across all messages", () => {
+test("#7849: a shape that used to exceed the shared suffix-work budget now completes cleanly under the per-message bound", () => {
   const body = makeSharedBudgetBody();
   const messages = body.messages as Array<{ content: string }>;
   const perMessageWork = messages.map(({ content }) => projectedSuffixWork(content, 2));
@@ -48,13 +55,8 @@ test("#7849: shares the two-pass suffix-work budget across all messages", () => 
     "each message must fit the two-pass budget on its own"
   );
   assert.ok(
-    messages.reduce((total, { content }) => total + projectedSuffixWork(content, 1), 0) <
-      SUFFIX_WORK_BUDGET,
-    "the pair must fit if incorrectly charged for only one pass"
-  );
-  assert.ok(
     perMessageWork.reduce((total, work) => total + work, 0) > SUFFIX_WORK_BUDGET,
-    "the pair must exceed the shared budget when correctly charged for two passes"
+    "the pair would have exceeded the old shared budget when charged for two passes"
   );
 
   for (const message of messages) {
@@ -64,20 +66,23 @@ test("#7849: shares the two-pass suffix-work budget across all messages", () => 
     assert.equal(individualResult.stats, null, "each message must be accepted individually");
   }
 
+  // The two messages use distinct tags ("first"/"second"), so they share no
+  // duplicate content — under the new per-message MAX_SUFFIX_STARTS /
+  // MAX_TOTAL_BLOCK_BYTES bound (well within budget at this size), the engine
+  // finds nothing to dedup and returns the body unchanged, with no warnings.
   const result = sessionDedupEngine.apply(body);
-  assert.deepEqual(result.stats?.validationWarnings, [SUFFIX_WORK_BUDGET_WARNING]);
+  assert.strictEqual(result.body, body, "no duplicates found: body must be returned by identity");
+  assert.equal(result.compressed, false);
+  assert.equal(result.stats, null);
 });
 
-test("#7849: exhausted suffix-work budget fails open with exact zero-savings stats", () => {
+test("#7849: the previously budget-exhausting shape produces no false-positive compression or warnings", () => {
   const body = makeSharedBudgetBody();
   const result = sessionDedupEngine.apply(body);
 
-  assert.strictEqual(result.body, body, "budget exhaustion must return the input body by identity");
+  assert.strictEqual(result.body, body, "no duplicates found: body must be returned by identity");
   assert.equal(result.compressed, false);
-  assert.ok(result.stats, "budget exhaustion must return explanatory stats");
-  assert.equal(result.stats.originalTokens, result.stats.compressedTokens);
-  assert.equal(result.stats.savingsPercent, 0);
-  assert.deepEqual(result.stats.validationWarnings, [SUFFIX_WORK_BUDGET_WARNING]);
+  assert.equal(result.stats, null, "no dedup work occurred, so no stats/warnings are produced");
 });
 
 test("#7849: near-boundary under-budget request still deduplicates", () => {
@@ -130,9 +135,16 @@ test(
       warnings: string[];
     };
     assert.deepEqual(output.enginesRun, ["session-dedup", "lite", "rtk", "headroom", "caveman"]);
+    // The fixture's lines are all unique (no repeated content), so under the
+    // new per-message MAX_SUFFIX_STARTS / MAX_TOTAL_BLOCK_BYTES bound
+    // session-dedup finds nothing to dedup and reports "no eligible content" —
+    // there is no longer a distinct "suffix work budget exceeded" warning.
+    // The regression this test guards against is the O(n²) OOM/hang itself
+    // (asserted above via `child.status === 0` within the heap/time budget),
+    // not this specific warning string.
     assert.ok(
-      output.warnings.includes("session-dedup: skipped (suffix work budget exceeded)"),
-      `expected an explicit session-dedup work-budget warning, got ${JSON.stringify(output.warnings)}`
+      output.warnings.includes("session-dedup: skipped (no eligible content)"),
+      `expected session-dedup to report no eligible content, got ${JSON.stringify(output.warnings)}`
     );
   }
 );

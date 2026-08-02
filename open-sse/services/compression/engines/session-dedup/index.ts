@@ -47,14 +47,19 @@ const DEFAULT_MIN_BLOCK_CHARS = 80;
 /** Minimum number of lines a block must span to be a dedup candidate. */
 const MIN_BLOCK_LINES = 3;
 /**
- * Request-wide ceiling for the suffix strings materialized by the exact pass.
- * 32 MiB keeps ordinary sessions byte-identical while preventing line-rich inputs
- * from retaining a quadratic graph of suffix copies.
+ * O(n²) guard for {@link findSuffixBlocks} (OOM incident): a single message with
+ * thousands of lines otherwise generates one full-length suffix string PER line,
+ * all retained at once. A real agent conversation embedding a large
+ * line-numbered file view (e.g. a tool result pasting a multi-thousand-line
+ * file back into the chat) drove ~1.7GB of live suffix strings and OOM-killed
+ * the 2GB heap (heap snapshot confirmed 6801 `{ block }` objects). These bound
+ * both the number of suffix starts scanned
+ * and the total bytes of retained blocks, so memory is O(budget) instead of O(n²).
+ * Dedup is best-effort — skipping the tail only forgoes some compression, never
+ * changes output correctness.
  */
-const MAX_SUFFIX_WORK_CHARS = 32 * 1024 * 1024;
-const SUFFIX_WORK_BUDGET_WARNING = "session-dedup: skipped (suffix work budget exceeded)";
-
-type SuffixWorkBudget = { remaining: number };
+const MAX_SUFFIX_STARTS = 2000;
+const MAX_TOTAL_BLOCK_BYTES = 8 * 1024 * 1024;
 
 // ─── hash helper (SHA-256 prefix, collision-resistant) ───────────────────────
 
@@ -66,24 +71,6 @@ function hashBlock(text: string): string {
 }
 
 // ─── suffix-block extraction ──────────────────────────────────────────────────
-
-/**
- * Reserves the characters that findSuffixBlocks() would materialize for one text.
- * The scan observes line starts without splitting or constructing any suffix strings.
- */
-function reserveSuffixWork(text: string, passCount: number, budget: SuffixWorkBudget): boolean {
-  let start = 0;
-  while (start <= text.length) {
-    const suffixChars = (text.length - start) * passCount;
-    if (suffixChars > budget.remaining) return false;
-    budget.remaining -= suffixChars;
-
-    const nextNewline = text.indexOf("\n", start);
-    if (nextNewline === -1) break;
-    start = nextNewline + 1;
-  }
-  return true;
-}
 
 /**
  * For each starting line position, emit the suffix block `lines[start..end]`
@@ -102,18 +89,66 @@ function findSuffixBlocks(
   const seen = new Set<string>();
   const results: Array<{ block: string; startLine: number }> = [];
 
-  for (let start = 0; start < n; start++) {
+  // O(n²) guard (#OOM): cap the number of suffix starts and the total retained
+  // block bytes so a huge message can't materialize thousands of full-length
+  // suffix strings at once. See MAX_SUFFIX_STARTS / MAX_TOTAL_BLOCK_BYTES.
+  const maxStarts = Math.min(n, MAX_SUFFIX_STARTS);
+  let totalBlockBytes = 0;
+  for (let start = 0; start < maxStarts; start++) {
     const block = lines.slice(start).join("\n");
     const blockLines = n - start;
     if (blockLines >= MIN_BLOCK_LINES && block.length >= minBlockChars && !seen.has(block)) {
       seen.add(block);
       results.push({ block, startLine: start });
+      totalBlockBytes += block.length;
+      if (totalBlockBytes >= MAX_TOTAL_BLOCK_BYTES) break;
     }
   }
   return results;
 }
 
 // ─── two-pass dedup on message texts ─────────────────────────────────────────
+
+/**
+ * Replace every occurrence of `needle` in `haystack` after the first with
+ * `marker`, keeping the first occurrence intact. Returns the new string and
+ * how many replacements were made.
+ *
+ * Uses plain `indexOf`/slice instead of a dynamically-built global RegExp:
+ * escaping an up-to-multi-hundred-KB literal block into a RegExp and running
+ * it (once per candidate block, once for counting + once for replacing) is
+ * pathologically slow on large single-message inputs — the exact
+ * multi-thousand-line "huge tool result" shape the O(n²) guard above targets
+ * (#OOM incident) — so a single call could still take tens of seconds even
+ * though findSuffixBlocks itself is bounded. indexOf-based scanning is O(n)
+ * per pass and has no compile step.
+ */
+function replaceAllButFirst(
+  haystack: string,
+  needle: string,
+  marker: string
+): { result: string; occurrences: number } {
+  if (needle.length === 0) return { result: haystack, occurrences: 0 };
+
+  const firstIdx = haystack.indexOf(needle);
+  if (firstIdx === -1) return { result: haystack, occurrences: 0 };
+
+  let occurrences = 1;
+  let searchFrom = firstIdx + needle.length;
+  let result = haystack.slice(0, searchFrom);
+  let cursor = searchFrom;
+
+  for (;;) {
+    const idx = haystack.indexOf(needle, cursor);
+    if (idx === -1) break;
+    occurrences++;
+    result += haystack.slice(cursor, idx) + marker;
+    cursor = idx + needle.length;
+  }
+  result += haystack.slice(cursor);
+
+  return { result, occurrences };
+}
 
 /**
  * Deduplicates repeated lines within a single message (intra-message dedup).
@@ -128,36 +163,22 @@ function dedupeWithinMessage(
 
   if (blocks.length < 2) return { deduped: text, changed: false };
 
-  // Find the most common block (likely candidate for intra-message dedup).
-  const blockFreq = new Map<string, number>();
-  for (const { block } of blocks) {
-    blockFreq.set(block, (blockFreq.get(block) || 0) + 1);
-  }
-
-  // Sort by frequency descending, then by length descending (prefer replacing more common, longer blocks first).
-  const sortedBlocks = [...blocks].sort((a, b) => {
-    const freqDiff = (blockFreq.get(b.block) || 0) - (blockFreq.get(a.block) || 0);
-    return freqDiff !== 0 ? freqDiff : b.block.length - a.block.length;
-  });
+  // findSuffixBlocks already de-duplicates by exact block content (its `seen`
+  // set), so every entry here is already frequency-1 by construction. Sort by
+  // length descending so the longest candidate blocks are tried first.
+  const sortedBlocks = [...blocks].sort((a, b) => b.block.length - a.block.length);
 
   let result = text;
   let changed = false;
 
   for (const { block } of sortedBlocks) {
-    // Only dedup blocks that appear 2+ times in the text.
-    const occurrences = (
-      result.match(new RegExp(block.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")) || []
-    ).length;
-    if (occurrences < 2) continue;
-
     const sha = hashBlock(block);
     const marker = `[dedup:ref sha=${sha}]`;
-    // Replace ALL occurrences except the first (keep the original once).
-    let count = 0;
-    result = result.replace(new RegExp(block.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"), () => {
-      count++;
-      return count === 1 ? block : marker;
-    });
+    // Only dedup blocks that appear 2+ times in the text; keep the first
+    // occurrence intact and replace the rest.
+    const { result: replaced, occurrences } = replaceAllButFirst(result, block, marker);
+    if (occurrences < 2) continue;
+    result = replaced;
     changed = true;
   }
 
@@ -269,7 +290,7 @@ type MessageLike = {
 function processMessages(
   messages: MessageLike[],
   minBlockChars: number
-): { messages: MessageLike[]; dedupCount: number; suffixWorkBudgetExceeded: boolean } {
+): { messages: MessageLike[]; dedupCount: number } {
   // Collect (msgIdx, text) for non-system string-content messages.
   // For multipart, index each text part separately.
   const msgTexts: Array<{ msgIdx: number; text: string }> = [];
@@ -291,24 +312,13 @@ function processMessages(
   }
 
   if (msgTexts.length === 0) {
-    return { messages, dedupCount: 0, suffixWorkBudgetExceeded: false };
-  }
-
-  // Single-message exact dedup enumerates suffixes once; cross-message dedup does so
-  // in both passes. Reserve the request-wide work up front so no quadratic suffix graph
-  // is partially materialized before the engine decides to fail open.
-  const suffixWorkBudget: SuffixWorkBudget = { remaining: MAX_SUFFIX_WORK_CHARS };
-  const passCount = msgTexts.length === 1 ? 1 : 2;
-  for (const { text } of msgTexts) {
-    if (!reserveSuffixWork(text, passCount, suffixWorkBudget)) {
-      return { messages, dedupCount: 0, suffixWorkBudgetExceeded: true };
-    }
+    return { messages, dedupCount: 0 };
   }
 
   const { deduped, dedupCount } = dedupMessageTexts(msgTexts, minBlockChars);
 
   if (dedupCount === 0) {
-    return { messages, dedupCount: 0, suffixWorkBudgetExceeded: false };
+    return { messages, dedupCount: 0 };
   }
 
   const result = messages.map((msg, i) => {
@@ -337,7 +347,7 @@ function processMessages(
     return { ...msg };
   });
 
-  return { messages: result, dedupCount, suffixWorkBudgetExceeded: false };
+  return { messages: result, dedupCount };
 }
 
 // ─── schema & validation ──────────────────────────────────────────────────────
@@ -383,8 +393,7 @@ function validateSessionDedupConfig(config: Record<string, unknown>): EngineVali
     const f = config["fuzzy"];
     if (typeof f === "object" && f !== null) {
       const fe = (f as Record<string, unknown>)["enabled"];
-      if (fe !== undefined && typeof fe !== "boolean")
-        errors.push("fuzzy.enabled must be a boolean");
+      if (fe !== undefined && typeof fe !== "boolean") errors.push("fuzzy.enabled must be a boolean");
     } else if (typeof f !== "boolean") {
       errors.push("fuzzy must be an object { enabled } or a boolean");
     }
@@ -435,18 +444,10 @@ export const sessionDedupEngine: CompressionEngine = {
     }
 
     const start = performance.now();
-    const {
-      messages: exactMessages,
-      dedupCount,
-      suffixWorkBudgetExceeded,
-    } = processMessages(messages as MessageLike[], minBlockChars);
-
-    if (suffixWorkBudgetExceeded) {
-      const durationMs = Math.round(performance.now() - start);
-      const stats = createCompressionStats(body, body, "stacked", [], undefined, durationMs);
-      stats.validationWarnings = [SUFFIX_WORK_BUDGET_WARNING];
-      return { body, compressed: false, stats };
-    }
+    const { messages: exactMessages, dedupCount } = processMessages(
+      messages as MessageLike[],
+      minBlockChars
+    );
 
     const { messages: finalMessages, fuzzyCount } = runFuzzyPass(
       exactMessages,
