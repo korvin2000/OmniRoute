@@ -42,6 +42,31 @@ interface ClientRawRequest {
 }
 
 /**
+ * Flatten a single embedding item's vector to the OpenAI-spec `number[]` shape.
+ *
+ * Some OpenAI-compatible embedding backends — notably a llama.cpp
+ * `llama-server --embedding --pooling ...` instance — return each vector wrapped in one
+ * extra array level: `[[...floats]]` instead of `[...floats]` for a single input. That
+ * extra level is silently spec-breaking, since a standard OpenAI-SDK consumer reading
+ * `response.data[i].embedding` gets a length-1 array holding the real vector instead of
+ * the vector itself. Unwrap only that single redundant level; vectors that are already
+ * flat (or genuinely multi-row) are left untouched. See issue #9089.
+ */
+function flattenSingleRowEmbedding(item: unknown): void {
+  if (!item || typeof item !== "object" || !("embedding" in item)) return;
+  const record = item as { embedding: unknown };
+  const embedding = record.embedding;
+  if (
+    Array.isArray(embedding) &&
+    embedding.length === 1 &&
+    Array.isArray(embedding[0]) &&
+    typeof embedding[0][0] === "number"
+  ) {
+    record.embedding = embedding[0];
+  }
+}
+
+/**
  * Handle embedding request.
  * Supports both hardcoded cloud providers and dynamic local provider_nodes.
  * When resolvedProvider is passed, uses it directly (injection pattern from route handler).
@@ -358,6 +383,19 @@ export async function handleEmbedding({
 
     // Log provider response
     reqLogger.logProviderResponse(response.status, "", response.headers, data);
+
+    // OpenAI-spec compliance (#9089): each item's `embedding` must be a flat number[].
+    // Some OpenAI-compatible backends (e.g. a llama.cpp `llama-server --embedding`
+    // instance) return the vector wrapped in one extra array level — `[[...floats]]`
+    // instead of `[...floats]` — for a single input, which silently breaks any standard
+    // OpenAI-SDK consumer doing `response.data[i].embedding`. Flatten that one redundant
+    // level without touching providers that already return flat vectors.
+    const responseItems = data.data || data;
+    if (Array.isArray(responseItems)) {
+      for (const item of responseItems) {
+        flattenSingleRowEmbedding(item);
+      }
+    }
 
     // Normalize response to OpenAI format
     const normalizedResponse = {
