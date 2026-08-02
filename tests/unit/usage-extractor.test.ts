@@ -194,7 +194,7 @@ test("extractUsageFromResponse reads Gemini usageMetadata and thinking tokens", 
 
   assert.deepEqual(usage, {
     prompt_tokens: 11,
-    completion_tokens: 5,
+    completion_tokens: 7,
     reasoning_tokens: 2,
   });
 });
@@ -389,7 +389,7 @@ test("extractUsage reads top-level Gemini usageMetadata from a streaming chunk",
   });
 
   assert.equal(usage.prompt_tokens, 120);
-  assert.equal(usage.completion_tokens, 60);
+  assert.equal(usage.completion_tokens, 72);
   assert.equal(usage.total_tokens, 180);
   assert.equal(usage.cached_tokens, 30);
   assert.equal(usage.reasoning_tokens, 12);
@@ -412,7 +412,7 @@ test("extractUsage reads Antigravity usageMetadata wrapped inside a response env
 
   assert.notEqual(usage, null);
   assert.equal(usage.prompt_tokens, 200);
-  assert.equal(usage.completion_tokens, 75);
+  assert.equal(usage.completion_tokens, 93);
   assert.equal(usage.total_tokens, 275);
   assert.equal(usage.cached_tokens, 40);
   assert.equal(usage.reasoning_tokens, 18);

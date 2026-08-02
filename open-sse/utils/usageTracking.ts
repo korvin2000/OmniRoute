@@ -425,12 +425,15 @@ export function extractUsage(chunk) {
   // chunks do not silently drop token usage.
   const usageMeta = chunk.usageMetadata || chunk.response?.usageMetadata;
   if (usageMeta && typeof usageMeta === "object") {
+    // Gemini reports thoughts outside candidates. Fold them into completion so
+    // every provider keeps reasoning as a subset of completion tokens.
+    const thoughts = usageMeta.thoughtsTokenCount || 0;
     return normalizeUsage({
       prompt_tokens: usageMeta.promptTokenCount || 0,
-      completion_tokens: usageMeta.candidatesTokenCount || 0,
+      completion_tokens: (usageMeta.candidatesTokenCount || 0) + thoughts,
       total_tokens: usageMeta.totalTokenCount,
       cached_tokens: usageMeta.cachedContentTokenCount,
-      reasoning_tokens: usageMeta.thoughtsTokenCount,
+      reasoning_tokens: thoughts,
     });
   }
 

@@ -91,10 +91,13 @@ export function extractUsageFromResponse(responseBody, provider) {
 
   // Gemini format
   if (responseBody.usageMetadata && typeof responseBody.usageMetadata === "object") {
+    // Gemini reports thoughts outside candidates. Fold them into completion so
+    // every provider keeps reasoning as a subset of completion tokens.
+    const thoughts = responseBody.usageMetadata.thoughtsTokenCount || 0;
     return {
       prompt_tokens: responseBody.usageMetadata.promptTokenCount || 0,
-      completion_tokens: responseBody.usageMetadata.candidatesTokenCount || 0,
-      reasoning_tokens: responseBody.usageMetadata.thoughtsTokenCount,
+      completion_tokens: (responseBody.usageMetadata.candidatesTokenCount || 0) + thoughts,
+      reasoning_tokens: thoughts,
     };
   }
 
