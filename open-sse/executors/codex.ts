@@ -48,6 +48,12 @@ export {
   getCodexDualWindowCooldownMs,
 } from "./codex/quota.ts";
 import { isCodexFreePlan, normalizeCodexTools } from "./codex/tools.ts";
+import {
+  CODEX_EFFORT_ORDER as EFFORT_ORDER,
+  GPT_5_6_ULTRA_ALIAS_MODELS,
+  splitCodexReasoningSuffix,
+  type CodexEffortLevel as EffortLevel,
+} from "./codex/reasoningSuffix.ts";
 // Re-exported for external importers (tests + provider services).
 export { isCodexFreePlan, normalizeCodexTools } from "./codex/tools.ts";
 
@@ -117,12 +123,6 @@ function codexWebSocketUnavailableResponse(): Response {
 // Ref: sub2api PR #1129 (feat(openai): split codex spark rate limiting from codex)
 export { getCodexModelScope, getCodexRateLimitKey, type CodexQuotaScope };
 
-// Ordered list of effort levels from lowest to highest
-const EFFORT_ORDER = ["none", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
-type EffortLevel = (typeof EFFORT_ORDER)[number];
-const STANDARD_EFFORT_SUFFIXES = ["none", "low", "medium", "high", "xhigh"] as const;
-const GPT_5_6_MAX_ALIAS_MODELS = new Set(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
-const GPT_5_6_ULTRA_ALIAS_MODELS = new Set(["gpt-5.6-sol", "gpt-5.6-terra"]);
 const CODEX_FAST_WIRE_VALUE = "priority";
 const CODEX_RESPONSES_WS_URL = "wss://chatgpt.com/backend-api/codex/responses";
 const CODEX_RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite";
@@ -183,32 +183,6 @@ function enforceCodexResponsesLiteParallelToolCalls(
   const body = bodyInput as Record<string, unknown>;
   if (body.parallel_tool_calls === false) return bodyInput;
   return { ...body, parallel_tool_calls: false };
-}
-
-function splitCodexReasoningSuffix(model: unknown): {
-  baseModel: string;
-  effort: EffortLevel | null;
-} {
-  const modelId = typeof model === "string" ? model : "";
-  const gpt56AliasMatch = /^(gpt-5\.6-(?:sol|terra|luna))-(max|ultra)$/.exec(modelId);
-  if (gpt56AliasMatch) {
-    const [, baseModel, alias] = gpt56AliasMatch;
-    const supportedModels =
-      alias === "ultra" ? GPT_5_6_ULTRA_ALIAS_MODELS : GPT_5_6_MAX_ALIAS_MODELS;
-    if (supportedModels.has(baseModel)) {
-      return { baseModel, effort: alias as EffortLevel };
-    }
-  }
-
-  for (const level of STANDARD_EFFORT_SUFFIXES) {
-    if (modelId.endsWith(`-${level}`)) {
-      return {
-        baseModel: modelId.slice(0, -`-${level}`.length),
-        effort: level,
-      };
-    }
-  }
-  return { baseModel: modelId, effort: null };
 }
 
 export function getCodexUpstreamModel(model: unknown): string {
