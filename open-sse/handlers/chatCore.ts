@@ -1091,6 +1091,10 @@ export async function handleChatCore({
   // settings read below, then threaded to executor.execute() further down. Lives at
   // function scope because the read happens inside the per-message compression block.
   let contextEditingEnabled = false;
+  // The dashboard's global compression switch must also control the built-in
+  // reactive and last-resort compaction passes. Otherwise an operator selecting
+  // "off" still has large histories rewritten by trim_tools/purify_history.
+  let reactiveContextCompactionEnabled = false;
   // Hoisted to function scope (not just the compression-block scope below) so the
   // combo-resolved override survives to the final enforceOutputTokenBudget() call
   // further down — see #8378 (context limit resolved by the combo was silently
@@ -1107,6 +1111,7 @@ export async function handleChatCore({
       compressionSettings?.exclusions
     );
     let promptCompressionEnabled = compressionSettingsResult.enabled && !compressionExcluded;
+    reactiveContextCompactionEnabled = compressionSettingsResult.enabled && !compressionExcluded;
     contextEditingEnabled = compressionSettingsResult.contextEditingEnabled;
     if (compressionExcluded) {
       void writeCompressionSkip(
@@ -1756,7 +1761,7 @@ export async function handleChatCore({
     // engines (Caveman/RTK). Codex Desktop / Responses clients need this path even
     // when those engines are off, otherwise multi-turn image sessions hard-reject
     // at the budget check below (#8560).
-    if (estimatedTokens > threshold) {
+    if (reactiveContextCompactionEnabled && estimatedTokens > threshold) {
       log?.info?.(
         "CONTEXT",
         `Proactive compression triggered: ${estimatedTokens} tokens > ${threshold} threshold (${contextLimit} limit)`
@@ -1847,7 +1852,7 @@ export async function handleChatCore({
 
   // Last-resort compaction against the concrete input budget (not the 70% threshold).
   // Covers cases where the proactive pass was skipped or still left the request oversized (#8560).
-  if (finalEstimatedInputTokens >= finalContextLimit && body) {
+  if (reactiveContextCompactionEnabled && finalEstimatedInputTokens >= finalContextLimit && body) {
     const lastResortTarget = Math.max(1, finalContextLimit - toolsReserve - 1);
     const lastResortAdapter = adaptBodyForCompression(body as Record<string, unknown>);
     const lastResortResult = compressContext(lastResortAdapter.body, {
